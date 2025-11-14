@@ -1,0 +1,19 @@
+# AI Multi-Pair Monitor - Requirements
+
+# Core dependencies
+numpy>=1.21.0
+pandas>=1.3.0
+requests>=2.26.0
+
+# Machine Learning
+scikit-learn>=1.0.0
+
+# GUI
+matplotlib>=3.4.0
+
+# Optional: Deep Learning (per future implementazioni)
+# tensorflow>=2.8.0
+# torch>=1.10.0
+
+# Sistema operativo
+# Per Windows: installa anche python-tk se non già presente
