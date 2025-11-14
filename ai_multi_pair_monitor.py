@@ -2,6 +2,7 @@
 """
 AI Multi-Pair Monitor - Sistema Avanzato di Trading con Intelligenza Artificiale
 Monitoraggio automatico di tutte le coppie BTC/USDC con ML per segnali buy/sell
+CON TRADING AUTOMATICO INTEGRATO
 """
 
 import tkinter as tk
@@ -17,6 +18,14 @@ from typing import Dict, List, Tuple
 import json
 import pickle
 import os
+
+# Integrazione Binance Trading
+try:
+    from advanced_binance_integration import BinanceTradingIntegration
+    TRADING_AVAILABLE = True
+except ImportError:
+    TRADING_AVAILABLE = False
+    print("⚠️  advanced_binance_integration.py non trovato. Trading automatico disabilitato.")
 
 # Machine Learning imports
 try:
@@ -308,8 +317,8 @@ class BinanceMultiPairMonitor:
         # Thread safety
         self.lock = threading.Lock()
 
-    def fetch_all_trading_pairs(self, base_assets: List[str] = ['BTC', 'USDC', 'USDT']) -> List[str]:
-        """Fetch tutte le coppie disponibili"""
+    def fetch_all_trading_pairs(self, base_assets: List[str] = ['BTC', 'USDC']) -> List[str]:
+        """Fetch tutte le coppie disponibili - SOLO BTC E USDC"""
 
         try:
             response = requests.get(f"{self.base_url}/api/v3/exchangeInfo", timeout=10)
@@ -317,27 +326,31 @@ class BinanceMultiPairMonitor:
             if response.status_code == 200:
                 data = response.json()
 
+                # Reset cache
+                self.btc_pairs = []
+                self.usdc_pairs = []
                 pairs = []
+
                 for symbol_info in data['symbols']:
                     if symbol_info['status'] == 'TRADING':
                         symbol = symbol_info['symbol']
                         quote = symbol_info['quoteAsset']
 
-                        # Filtra per base asset richiesti
+                        # ✅ FILTRO: SOLO BTC E USDC (NON USDT!)
                         if quote in base_assets:
                             pairs.append(symbol)
 
                             # Categorizza
                             if quote == 'BTC':
                                 self.btc_pairs.append(symbol)
-                            elif quote in ['USDC', 'USDT']:
+                            elif quote == 'USDC':
                                 self.usdc_pairs.append(symbol)
 
                 self.all_trading_pairs = pairs
 
-                print(f"✅ Trovate {len(pairs)} coppie trading")
+                print(f"✅ Trovate {len(pairs)} coppie trading (SOLO BTC/USDC)")
                 print(f"   BTC pairs: {len(self.btc_pairs)}")
-                print(f"   USDC/USDT pairs: {len(self.usdc_pairs)}")
+                print(f"   USDC pairs: {len(self.usdc_pairs)}")
 
                 return pairs
 
@@ -368,19 +381,64 @@ class BinanceMultiPairMonitor:
 
         return {'bids': [], 'asks': [], 'timestamp': datetime.now()}
 
-    def update_pair_data(self, symbol: str):
-        """Aggiorna dati per una coppia"""
+    def fetch_candlestick_data(self, symbol: str, interval: str = '15m', limit: int = 100) -> List[dict]:
+        """Fetch candlestick data per timeframe analysis
+
+        Args:
+            symbol: Trading pair symbol
+            interval: Timeframe - '1m', '5m', '15m', '1h', '4h', '1d'
+            limit: Number of candles (max 1000)
+        """
+
+        try:
+            url = f"{self.base_url}/api/v3/klines"
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'limit': limit
+            }
+
+            response = requests.get(url, params=params, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+
+                candles = []
+                for candle in data:
+                    candles.append({
+                        'open_time': candle[0],
+                        'open': float(candle[1]),
+                        'high': float(candle[2]),
+                        'low': float(candle[3]),
+                        'close': float(candle[4]),
+                        'volume': float(candle[5]),
+                        'close_time': candle[6],
+                        'quote_volume': float(candle[7]),
+                        'trades': int(candle[8])
+                    })
+
+                return candles
+
+        except Exception as e:
+            print(f"❌ Error fetch candles {symbol}: {e}")
+
+        return []
+
+    def update_pair_data(self, symbol: str, timeframe: str = '15m'):
+        """Aggiorna dati per una coppia con supporto timeframe"""
 
         with self.lock:
             # Inizializza se non esiste
             if symbol not in self.pairs_data:
                 self.pairs_data[symbol] = {
                     'orderbook': None,
+                    'candles': None,
                     'features': None,
                     'historical_features': deque(maxlen=50),
                     'prediction': None,
                     'confidence': 0.0,
-                    'last_update': None
+                    'last_update': None,
+                    'timeframe': timeframe
                 }
 
             pair_data = self.pairs_data[symbol]
@@ -388,6 +446,10 @@ class BinanceMultiPairMonitor:
             # Fetch orderbook
             orderbook = self.fetch_orderbook(symbol)
             pair_data['orderbook'] = orderbook
+
+            # Fetch candlestick data per timeframe
+            candles = self.fetch_candlestick_data(symbol, interval=timeframe, limit=20)
+            pair_data['candles'] = candles
 
             # Estrai features
             extractor = OrderBookFeatureExtractor()
@@ -507,7 +569,7 @@ class AIMultiPairGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("🤖 AI Multi-Pair Monitor - Binance Trading Intelligence")
+        self.root.title("🤖 AI Multi-Pair Monitor - Binance Trading Intelligence + AUTO TRADING")
         self.root.geometry("1800x1000")
         self.root.configure(bg='#1a1a1a')
 
@@ -516,12 +578,21 @@ class AIMultiPairGUI:
         self.is_monitoring = False
         self.monitoring_thread = None
 
+        # Binance Trading Integration
+        self.binance_trading = None
+        self.trading_enabled = False
+
         # Config
         self.config = {
             'update_interval': 10,  # secondi
             'pairs_to_monitor': 50,  # numero coppie da monitorare
             'min_confidence': 0.70,  # confidence minima per segnale
-            'base_assets': ['USDC', 'USDT']  # Asset base da monitorare
+            'base_assets': ['BTC', 'USDC'],  # ✅ SOLO BTC E USDC (NON USDT)
+            'timeframe': '15m',  # ✅ Timeframe per analisi candlestick
+            'auto_trading': False,  # ✅ Trading automatico
+            'trade_amount_usd': 50.0,  # ✅ Amount per trade
+            'api_key': '',  # ✅ Binance API key
+            'api_secret': ''  # ✅ Binance API secret
         }
 
         # Setup GUI
@@ -532,6 +603,9 @@ class AIMultiPairGUI:
         if os.path.exists(model_path):
             self.monitor.ml_model.load_model(model_path)
             self.update_model_status()
+
+        # Try to setup Binance trading if credentials exist
+        self.try_setup_binance_trading()
 
     def setup_gui(self):
         """Setup interfaccia principale"""
@@ -603,6 +677,36 @@ class AIMultiPairGUI:
         tk.Label(config_frame, text="Min Confidence:", bg='#2d2d2d', fg='white', font=('Arial', 8)).pack()
         self.confidence_var = tk.DoubleVar(value=self.config['min_confidence'])
         tk.Spinbox(config_frame, from_=0.5, to=0.99, increment=0.05, textvariable=self.confidence_var, width=10).pack(pady=2)
+
+        # ✅ NUOVO: Timeframe selector
+        tk.Label(config_frame, text="Timeframe:", bg='#2d2d2d', fg='white', font=('Arial', 8)).pack()
+        self.timeframe_var = tk.StringVar(value=self.config['timeframe'])
+        timeframe_combo = ttk.Combobox(config_frame, textvariable=self.timeframe_var,
+                                       values=['1m', '5m', '15m', '30m', '1h', '4h', '1d'],
+                                       width=8, state='readonly')
+        timeframe_combo.pack(pady=2)
+
+        # Colonna 4: Auto Trading
+        trading_frame = tk.LabelFrame(control_frame, text="🤖 Auto Trading", bg='#2d2d2d', fg='white', font=('Arial', 10, 'bold'))
+        trading_frame.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+
+        self.trading_status_label = tk.Label(trading_frame, text="Status: Disabled", bg='#2d2d2d', fg='red', font=('Arial', 9))
+        self.trading_status_label.pack(pady=2)
+
+        self.auto_trading_var = tk.BooleanVar(value=False)
+        self.auto_trading_check = tk.Checkbutton(trading_frame, text="Enable Auto Trading",
+                                                  variable=self.auto_trading_var,
+                                                  bg='#2d2d2d', fg='white',
+                                                  selectcolor='#1a1a1a',
+                                                  font=('Arial', 8),
+                                                  command=self.toggle_auto_trading)
+        self.auto_trading_check.pack(pady=2)
+
+        tk.Label(trading_frame, text="Trade Amount ($):", bg='#2d2d2d', fg='white', font=('Arial', 8)).pack()
+        self.trade_amount_var = tk.DoubleVar(value=self.config['trade_amount_usd'])
+        tk.Spinbox(trading_frame, from_=10, to=500, increment=10, textvariable=self.trade_amount_var, width=10).pack(pady=2)
+
+        tk.Button(trading_frame, text="⚙️ Setup API", command=self.setup_api_dialog, bg='#FF9800', fg='white', width=15).pack(pady=2)
 
         # === NOTEBOOK TABS ===
         notebook = ttk.Notebook(self.root)
@@ -843,19 +947,36 @@ class AIMultiPairGUI:
 
                 self.log(f"🔍 Scanning {len(pairs_to_check)} pairs...")
 
-                # Aggiorna dati per ogni coppia
+                # ✅ NUOVO: Get timeframe dalla config
+                timeframe = self.timeframe_var.get()
+
+                # Aggiorna dati per ogni coppia con timeframe
                 for symbol in pairs_to_check:
                     if not self.is_monitoring:
                         break
 
-                    self.monitor.update_pair_data(symbol)
+                    self.monitor.update_pair_data(symbol, timeframe=timeframe)
+
+                    # ✅ NUOVO: Auto trading se abilitato
+                    if self.trading_enabled:
+                        pair_data = self.monitor.pairs_data.get(symbol, {})
+                        prediction = pair_data.get('prediction')
+                        confidence = pair_data.get('confidence', 0)
+                        features = pair_data.get('features', {})
+
+                        if prediction is not None and prediction != 1:  # Non HOLD
+                            self.execute_auto_trade(symbol, prediction, confidence, features)
 
                 # Aggiorna GUI
                 self.root.after(0, self.update_signals_display)
                 self.root.after(0, self.update_pairs_display)
                 self.root.after(0, self.update_analytics)
 
-                self.log(f"✅ Scan completato. Prossimo update in {self.config['update_interval']}s")
+                scan_msg = f"✅ Scan completato (TF: {timeframe}). Prossimo update in {self.config['update_interval']}s"
+                if self.trading_enabled:
+                    scan_msg += " | 🔥 AUTO TRADING ACTIVE"
+
+                self.log(scan_msg)
 
                 # Sleep
                 time.sleep(self.config['update_interval'])
@@ -1011,6 +1132,187 @@ class AIMultiPairGUI:
         self.fig.tight_layout()
         self.canvas.draw()
 
+    def try_setup_binance_trading(self):
+        """Prova a configurare Binance trading se le credenziali sono disponibili"""
+        # Cerca file config.json per API keys
+        if os.path.exists('binance_config.json'):
+            try:
+                with open('binance_config.json', 'r') as f:
+                    config = json.load(f)
+                    self.config['api_key'] = config.get('api_key', '')
+                    self.config['api_secret'] = config.get('api_secret', '')
+
+                    if self.config['api_key'] and self.config['api_secret'] and TRADING_AVAILABLE:
+                        self.binance_trading = BinanceTradingIntegration(
+                            self.config['api_key'],
+                            self.config['api_secret'],
+                            testnet=False
+                        )
+
+                        # Config trading
+                        self.binance_trading.update_config({
+                            'auto_trade_enabled': False,
+                            'fixed_usd_amount': self.config['trade_amount_usd'],
+                            'min_confidence_threshold': self.config['min_confidence'],
+                            'max_open_positions': 3,
+                            'allowed_quote_assets': ['BTC', 'USDC']
+                        })
+
+                        self.log("✅ Binance Trading configurato!")
+                        self.trading_status_label.config(text="Status: Ready (Disabled)", fg='orange')
+            except Exception as e:
+                self.log(f"❌ Errore caricamento config: {e}")
+
+    def toggle_auto_trading(self):
+        """Attiva/disattiva auto trading"""
+        if not self.binance_trading:
+            messagebox.showerror("Error", "Binance Trading non configurato!\nUsa 'Setup API' prima.")
+            self.auto_trading_var.set(False)
+            return
+
+        if not self.monitor.ml_model or not self.monitor.ml_model.is_trained:
+            messagebox.showerror("Error", "Modello ML non addestrato!\nTrain il modello prima.")
+            self.auto_trading_var.set(False)
+            return
+
+        if self.auto_trading_var.get():
+            # Abilita trading
+            response = messagebox.askyesno(
+                "⚠️ ATTENZIONE - Trading Automatico",
+                "Stai per abilitare il TRADING AUTOMATICO REALE con SOLDI VERI!\n\n"
+                "Il sistema eseguirà automaticamente trade basati sui segnali ML.\n\n"
+                "Sei SICURO di voler continuare?"
+            )
+
+            if response:
+                self.trading_enabled = True
+                self.binance_trading.update_config({'auto_trade_enabled': True})
+                self.trading_status_label.config(text="Status: ACTIVE 🔥", fg='#00ff00')
+                self.log("🔥 AUTO TRADING ATTIVATO!")
+            else:
+                self.auto_trading_var.set(False)
+        else:
+            # Disabilita trading
+            self.trading_enabled = False
+            if self.binance_trading:
+                self.binance_trading.update_config({'auto_trade_enabled': False})
+            self.trading_status_label.config(text="Status: Disabled", fg='red')
+            self.log("⏸️ Auto trading disattivato")
+
+    def setup_api_dialog(self):
+        """Dialog per configurare API Binance"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("⚙️ Binance API Configuration")
+        dialog.geometry("500x300")
+        dialog.configure(bg='#2d2d2d')
+
+        tk.Label(dialog, text="Binance API Configuration", font=('Arial', 14, 'bold'),
+                 bg='#2d2d2d', fg='white').pack(pady=10)
+
+        tk.Label(dialog, text="API Key:", bg='#2d2d2d', fg='white').pack(pady=5)
+        api_key_entry = tk.Entry(dialog, width=50)
+        api_key_entry.insert(0, self.config.get('api_key', ''))
+        api_key_entry.pack(pady=5)
+
+        tk.Label(dialog, text="API Secret:", bg='#2d2d2d', fg='white').pack(pady=5)
+        api_secret_entry = tk.Entry(dialog, width=50, show='*')
+        api_secret_entry.insert(0, self.config.get('api_secret', ''))
+        api_secret_entry.pack(pady=5)
+
+        def save_config():
+            api_key = api_key_entry.get().strip()
+            api_secret = api_secret_entry.get().strip()
+
+            if not api_key or not api_secret:
+                messagebox.showerror("Error", "Inserisci sia API Key che Secret!")
+                return
+
+            if not TRADING_AVAILABLE:
+                messagebox.showerror("Error", "advanced_binance_integration.py non disponibile!")
+                return
+
+            try:
+                # Salva in config
+                self.config['api_key'] = api_key
+                self.config['api_secret'] = api_secret
+
+                # Salva in file
+                with open('binance_config.json', 'w') as f:
+                    json.dump({'api_key': api_key, 'api_secret': api_secret}, f)
+
+                # Inizializza trading
+                self.binance_trading = BinanceTradingIntegration(api_key, api_secret, testnet=False)
+
+                # Config
+                self.binance_trading.update_config({
+                    'auto_trade_enabled': False,
+                    'fixed_usd_amount': self.trade_amount_var.get(),
+                    'min_confidence_threshold': self.confidence_var.get(),
+                    'max_open_positions': 3,
+                    'allowed_quote_assets': ['BTC', 'USDC']
+                })
+
+                self.trading_status_label.config(text="Status: Ready (Disabled)", fg='orange')
+                self.log("✅ Binance API configurata con successo!")
+
+                dialog.destroy()
+                messagebox.showinfo("Success", "API configurata con successo!")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Errore configurazione:\n{e}")
+
+        tk.Button(dialog, text="💾 Save & Connect", command=save_config,
+                  bg='#4CAF50', fg='white', width=20).pack(pady=20)
+
+        tk.Label(dialog, text="⚠️ Le credenziali saranno salvate in binance_config.json",
+                 bg='#2d2d2d', fg='orange', font=('Arial', 8)).pack(pady=5)
+
+    def execute_auto_trade(self, symbol: str, signal: int, confidence: float, features: dict):
+        """Esegue trade automatico basato su segnale ML"""
+        if not self.trading_enabled or not self.binance_trading:
+            return
+
+        # Mappa segnale
+        signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
+        action = signal_map.get(signal, 'HOLD')
+
+        if action == 'HOLD':
+            return
+
+        # Verifica confidence
+        if confidence < self.confidence_var.get():
+            return
+
+        # Crea oggetto segnale compatibile
+        class TradingSignal:
+            def __init__(self, symbol, action, confidence, price):
+                self.symbol = symbol
+                self.action = action
+                self.confidence = confidence
+                self.price = price
+                self.timestamp = datetime.now()
+
+        trade_signal = TradingSignal(
+            symbol=symbol,
+            action=action,
+            confidence=confidence,
+            price=features.get('mid_price', 0)
+        )
+
+        try:
+            # Esegui trade
+            result = self.binance_trading.execute_signal(trade_signal)
+
+            if result['status'] == 'executed':
+                self.log(f"✅ AUTO TRADE: {symbol} {action} @ {confidence*100:.1f}% confidence")
+            elif result['status'] == 'skipped':
+                self.log(f"⏸️ Trade skipped: {symbol} - {result.get('reason', 'Unknown')}")
+            else:
+                self.log(f"❌ Trade failed: {symbol} - {result.get('error', 'Unknown')}")
+
+        except Exception as e:
+            self.log(f"❌ Errore auto trade {symbol}: {e}")
+
     def run(self):
         """Avvia GUI"""
         self.root.mainloop()
@@ -1019,22 +1321,32 @@ class AIMultiPairGUI:
 # === MAIN ===
 if __name__ == "__main__":
     print("=" * 80)
-    print("🤖 AI MULTI-PAIR MONITOR - Binance Trading Intelligence")
+    print("🤖 AI MULTI-PAIR MONITOR - Binance Trading Intelligence + AUTO TRADING")
     print("=" * 80)
     print()
     print("📊 Features:")
-    print("   ✅ Monitoraggio automatico multi-coppia (BTC/USDC/USDT)")
-    print("   ✅ Machine Learning con Random Forest/Gradient Boosting")
+    print("   ✅ Monitoraggio automatico multi-coppia (SOLO BTC/USDC)")
+    print("   ✅ Machine Learning con Gradient Boosting Classifier")
     print("   ✅ 20+ features estratte dall'orderbook")
-    print("   ✅ Segnali BUY/SELL/HOLD con confidence")
+    print("   ✅ Segnali BUY/SELL/HOLD con confidence score")
+    print("   ✅ Timeframe configurabile (1m, 5m, 15m, 1h, 4h, 1d)")
     print("   ✅ Dashboard real-time con analytics")
     print("   ✅ Auto-training e model persistence")
+    print("   ✅ 🔥 TRADING AUTOMATICO con Binance")
     print()
     print("💡 Setup:")
     print("   1. Train il modello ML (bottone 'Train Model')")
     print("   2. Salva il modello (bottone 'Save Model')")
-    print("   3. Refresh pairs (bottone 'Refresh Pairs')")
-    print("   4. Start monitoring (bottone 'Start Monitoring')")
+    print("   3. Setup API Binance (bottone 'Setup API') - OPZIONALE per auto-trading")
+    print("   4. Refresh pairs (bottone 'Refresh Pairs')")
+    print("   5. Seleziona timeframe (dropdown)")
+    print("   6. Start monitoring (bottone 'Start Monitoring')")
+    print("   7. Abilita auto-trading (checkbox) - SOLO SE CONFIGURATO API")
+    print()
+    print("⚠️  DISCLAIMER:")
+    print("   Il trading automatico è DISABILITATO di default.")
+    print("   Richiede configurazione API Binance manuale.")
+    print("   Usa a tuo rischio. Il sistema è in fase BETA.")
     print()
     print("🚀 Avvio GUI...")
     print("=" * 80)
